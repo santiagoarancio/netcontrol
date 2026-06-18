@@ -1,325 +1,176 @@
 /**
- * NetControl Proxy — Node.js
- * Corre en tu PC y sirve como puente entre la app (celular) y el router
- * 
- * Uso: node proxy.js
- * Luego abrís: http://TU_IP_LOCAL:3000
+ * NetControl Proxy — Termux
+ * Puente entre la app (Chrome Android) y el router HG8145V5
+ * Uso: node proxy.js → luego abrir http://localhost:3000
  */
-
 const http = require('http');
-const https = require('https');
-const url = require('url');
-const fs = require('fs');
+const fs   = require('fs');
+const url  = require('url');
 const path = require('path');
 
-const PORT = 3000;
-const ROUTER_IP = '192.168.100.1';
+const PORT       = 3000;
+const ROUTER     = '192.168.100.1';
 const ROUTER_PORT = 80;
+let cookie = '';
+let lastLogin = 0;
+const SESSION_TTL = 10 * 60 * 1000;
 
-// ── Sesión del router ──────────────────────────────────────────────────────
-let sessionCookie = '';
-
-// ── Helper: request al router ─────────────────────────────────────────────
-function routerRequest(options, body = null) {
-  return new Promise((resolve, reject) => {
-    const req = http.request({
-      hostname: ROUTER_IP,
-      port: ROUTER_PORT,
-      ...options,
+function rq(opts, body) {
+  return new Promise((res, rej) => {
+    const to = setTimeout(() => rej(new Error('Timeout')), 8000);
+    const r = http.request({
+      hostname: ROUTER, port: ROUTER_PORT, ...opts,
       headers: {
-        'Cookie': sessionCookie,
+        Cookie: cookie,
         'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'NetControl/1.0',
-        ...(options.headers || {}),
+        'User-Agent': 'Mozilla/5.0',
+        'Referer': `http://${ROUTER}/`,
+        ...(opts.headers || {})
       }
-    }, (res) => {
-      // Guardar cookies de sesión
-      const setCookie = res.headers['set-cookie'];
-      if (setCookie) {
-        sessionCookie = setCookie.map(c => c.split(';')[0]).join('; ');
-        console.log('Cookie de sesión guardada:', sessionCookie);
-      }
-
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+    }, (rs) => {
+      clearTimeout(to);
+      const sc = rs.headers['set-cookie'];
+      if (sc) cookie = sc.map(c => c.split(';')[0]).join('; ');
+      let d = ''; rs.on('data', c => d += c);
+      rs.on('end', () => res({ status: rs.statusCode, body: d }));
     });
-
-    req.on('error', reject);
-    if (body) req.write(body);
-    req.end();
+    r.on('error', e => { clearTimeout(to); rej(e); });
+    if (body) r.write(body);
+    r.end();
   });
 }
 
-// ── Encontrar URLs reales del router ──────────────────────────────────────
-async function findRouterPages() {
-  const pagesToTry = [
-    '/userlogin.html',
-    '/login.html', 
-    '/index.html',
-    '/cgi-bin/luci',
-    '/home.asp',
-    '/main.asp',
+function json(res, code, data) {
+  res.writeHead(code, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type'
+  });
+  res.end(JSON.stringify(data));
+}
+
+async function login(u = 'root', pw = 'adminHW') {
+  if (cookie && Date.now() - lastLogin < SESSION_TTL) return { ok: true, cached: true };
+  const eps = [
+    { path: '/login.cgi',         body: `Username=${u}&Password=${pw}` },
+    { path: '/cgi-bin/login.cgi', body: `username=${u}&password=${pw}` },
+    { path: '/login',             body: `username=${u}&password=${pw}` },
+    { path: '/userlogin.cgi',     body: `UserName=${u}&PassWord=${pw}` },
   ];
-  
-  for (const p of pagesToTry) {
+  for (const ep of eps) {
     try {
-      const r = await routerRequest({ path: p, method: 'GET' });
-      if (r.status === 200) {
-        console.log(`Página encontrada: ${p}`);
-        return p;
+      const r = await rq({ path: ep.path, method: 'POST' }, ep.body);
+      if ((r.status === 200 || r.status === 302) && cookie) {
+        lastLogin = Date.now();
+        console.log(`[LOGIN OK] ${ep.path}`);
+        return { ok: true, endpoint: ep.path };
       }
     } catch(e) {}
   }
-  return '/';
+  return { ok: false, error: 'No se pudo autenticar' };
 }
 
-// ── Login al router ────────────────────────────────────────────────────────
-async function loginRouter(user, pass) {
-  // Intentar diferentes endpoints de login según firmware
-  const loginEndpoints = [
-    { path: '/login.cgi',        body: `Username=${user}&Password=${pass}` },
-    { path: '/cgi-bin/login.cgi',body: `username=${user}&password=${pass}` },
-    { path: '/login',            body: `username=${user}&password=${pass}&submit=Login` },
-    { path: '/userlogin.cgi',    body: `UserName=${user}&PassWord=${pass}` },
-    { path: '/cgi-bin/luci',     body: `luci_username=${user}&luci_password=${pass}` },
-  ];
-
-  for (const ep of loginEndpoints) {
-    try {
-      console.log(`Intentando login en: ${ep.path}`);
-      const r = await routerRequest({
-        path: ep.path,
-        method: 'POST',
-        headers: { 'Content-Length': Buffer.byteLength(ep.body) }
-      }, ep.body);
-      
-      console.log(`  Status: ${r.status}, Cookie: ${sessionCookie ? 'sí' : 'no'}`);
-      
-      if (r.status === 200 || r.status === 302 || r.status === 301) {
-        if (sessionCookie || r.headers.location) {
-          console.log('Login exitoso en:', ep.path);
-          return { ok: true, endpoint: ep.path };
-        }
-      }
-    } catch(e) {
-      console.log(`  Error: ${e.message}`);
-    }
+function parseDevices(html) {
+  const devs = []; const seen = new Set();
+  const rr = /<tr[\s\S]*?<\/tr>/gi; let m;
+  while ((m = rr.exec(html)) !== null) {
+    const row = m[0];
+    const mac = row.match(/([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}/)?.[0]?.toUpperCase();
+    const ip  = row.match(/\b(192\.168\.\d+\.\d+)\b/)?.[1];
+    if (!mac || !ip || ip === ROUTER || seen.has(mac)) continue;
+    seen.add(mac);
+    const cells = (row.match(/<td[^>]*>([^<]+)<\/td>/g) || []).map(c => c.replace(/<[^>]+>/g, '').trim());
+    const name = cells.find(t => t && t !== mac && !/^\d+$/.test(t) && !/192\.168/.test(t)) || 'Dispositivo';
+    devs.push({ mac, ip, name, status: 'online' });
   }
-  return { ok: false };
+  if (devs.length === 0) {
+    const macs = [...new Set((html.match(/([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}/g) || []).map(x => x.toUpperCase()))];
+    const ips  = [...new Set((html.match(/\b192\.168\.\d+\.\d+\b/g) || []).filter(i => i !== ROUTER))];
+    macs.forEach((mac, i) => { if (!seen.has(mac)) { seen.add(mac); devs.push({ mac, ip: ips[i] || `192.168.100.${100+i}`, name: 'Dispositivo', status: 'online' }); } });
+  }
+  return devs;
 }
 
-// ── Obtener dispositivos DHCP ──────────────────────────────────────────────
 async function getDevices() {
-  const dhcpPages = [
+  const pages = [
     '/html/bbsp/common/amp_dhcp_client_list.asp',
     '/html/amp_dhcp_client_list.asp',
-    '/cgi-bin/dhcp_clients',
-    '/dhcpinfo.html',
-    '/DHCPTable.asp',
-    '/connected_devices.html',
-    '/st_dhcp.html',
-    '/Status_Lan.asp',
+    '/dhcpinfo.html', '/st_dhcp.html', '/Status_Lan.asp',
+    '/userdevinfo.asp', '/connected_devices.html', '/cgi-bin/dhcp_clients',
   ];
-
-  for (const p of dhcpPages) {
+  for (const pg of pages) {
     try {
-      const r = await routerRequest({ path: p, method: 'GET' });
-      if (r.status === 200 && r.body.length > 100) {
-        console.log(`Dispositivos encontrados en: ${p}`);
-        return { ok: true, html: r.body, page: p };
+      const r = await rq({ path: pg, method: 'GET' });
+      if (r.status === 200 && r.body.length > 200) {
+        const d = parseDevices(r.body);
+        if (d.length > 0) { console.log(`[DEVICES] ${d.length} en ${pg}`); return { ok: true, devices: d, page: pg }; }
       }
     } catch(e) {}
   }
-
-  // Intentar la página principal y buscar tabla ARP
-  try {
-    const r = await routerRequest({ path: '/', method: 'GET' });
-    return { ok: true, html: r.body, page: '/' };
-  } catch(e) {}
-
-  return { ok: false, html: '', page: '' };
+  try { const r = await rq({ path: '/', method: 'GET' }); const d = parseDevices(r.body); return { ok: d.length > 0, devices: d, page: '/' }; } catch(e) {}
+  return { ok: false, devices: [], page: '' };
 }
 
-// ── Parsear dispositivos del HTML ──────────────────────────────────────────
-function parseDevices(html) {
-  const devices = [];
-  
-  // Patrón MAC universal
-  const macPattern = /([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}/g;
-  const ipPattern = /192\.168\.\d{1,3}\.\d{1,3}/g;
-  
-  const macs = [...new Set(html.match(macPattern) || [])];
-  const ips  = [...new Set(html.match(ipPattern) || [])].filter(ip => ip !== '192.168.100.1');
-  
-  // Intentar extraer por filas de tabla
-  const rowReg = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-  let match;
-  while ((match = rowReg.exec(html)) !== null) {
-    const row = match[1];
-    const mac = row.match(/([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}/)?.[0];
-    const ip  = row.match(/192\.168\.\d+\.\d+/)?.[0];
-    const nameMatch = row.match(/<td[^>]*>([a-zA-Z0-9\-_\.]+)<\/td>/g);
-    
-    if (mac && ip && ip !== '192.168.100.1') {
-      const name = nameMatch?.[0]?.replace(/<[^>]+>/g, '').trim() || 'Dispositivo';
-      if (!devices.find(d => d.mac === mac)) {
-        devices.push({ mac, ip, name, status: 'online' });
-      }
-    }
-  }
-  
-  // Fallback: combinar MACs e IPs encontradas
-  if (devices.length === 0 && macs.length > 0) {
-    macs.forEach((mac, i) => {
-      devices.push({
-        mac,
-        ip: ips[i] || `192.168.100.${10 + i}`,
-        name: 'Dispositivo',
-        status: 'online'
-      });
-    });
-  }
-  
-  return devices;
-}
-
-// ── Bloquear/desbloquear MAC ───────────────────────────────────────────────
-async function blockMAC(mac, block = true) {
-  const endpoints = [
-    '/html/bbsp/common/amp_wifi_mac_filter.asp',
-    '/cgi-bin/mac_filter',
-    '/wifiMacFilter.cgi',
-  ];
-
-  for (const ep of endpoints) {
+async function setMAC(mac, block) {
+  const eps = ['/html/bbsp/common/amp_wifi_mac_filter.asp', '/html/amp_wifi_mac_filter.asp', '/cgi-bin/mac_filter'];
+  for (const ep of eps) {
     try {
-      const body = block
-        ? `action=add&mac=${encodeURIComponent(mac)}&FilterMode=Blacklist`
-        : `action=del&mac=${encodeURIComponent(mac)}`;
-      
-      const r = await routerRequest({
-        path: ep, method: 'POST',
-        headers: { 'Content-Length': Buffer.byteLength(body) }
-      }, body);
-      
+      const body = block ? `action=add&mac=${encodeURIComponent(mac)}&FilterMode=Blacklist` : `action=del&mac=${encodeURIComponent(mac)}`;
+      const r = await rq({ path: ep, method: 'POST' }, body);
       if (r.status === 200) return { ok: true };
     } catch(e) {}
   }
   return { ok: false };
 }
 
-// ── Servidor HTTP ──────────────────────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
-  // CORS — permite requests desde cualquier origen
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Content-Type', 'application/json');
-
+http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
-    res.writeHead(200); res.end(); return;
+    res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' });
+    res.end(); return;
   }
-
-  const parsed = url.parse(req.url, true);
-  const route  = parsed.pathname;
-
-  // Leer body POST
-  let body = '';
-  req.on('data', chunk => body += chunk);
-  await new Promise(r => req.on('end', r));
+  const p = url.parse(req.url, true).pathname;
+  let body = ''; req.on('data', c => body += c); await new Promise(r => req.on('end', r));
   const params = new URLSearchParams(body);
-
-  console.log(`${req.method} ${route}`);
-
+  console.log(`[${req.method}] ${p}`);
   try {
-    // ── GET /status ──────────────────────────────────────────────────────
-    if (route === '/status') {
-      res.writeHead(200);
-      res.end(JSON.stringify({
-        ok: true,
-        router: ROUTER_IP,
-        session: !!sessionCookie,
-        version: '1.0'
-      }));
-
-    // ── POST /login ──────────────────────────────────────────────────────
-    } else if (route === '/login' && req.method === 'POST') {
-      const user = params.get('user') || 'root';
-      const pass = params.get('pass') || 'adminHW';
-      const result = await loginRouter(user, pass);
-      res.writeHead(200);
-      res.end(JSON.stringify(result));
-
-    // ── GET /devices ─────────────────────────────────────────────────────
-    } else if (route === '/devices') {
-      const result = await getDevices();
-      const devices = result.ok ? parseDevices(result.html) : [];
-      res.writeHead(200);
-      res.end(JSON.stringify({ ok: result.ok, devices, page: result.page, count: devices.length }));
-
-    // ── GET /rawhtml — para debugging ────────────────────────────────────
-    } else if (route === '/rawhtml') {
-      const page = parsed.query.page || '/';
-      const r = await routerRequest({ path: page, method: 'GET' });
-      res.setHeader('Content-Type', 'text/html');
-      res.writeHead(200);
+    if (p === '/' || p === '/index.html' || p === '/app') {
+      const f = path.join(__dirname, 'netcontrol-app.html');
+      if (fs.existsSync(f)) {
+        let html = fs.readFileSync(f, 'utf8');
+        html = html.replace('let demoMode = false;', 'let demoMode = false; window.PROXY_URL = "";');
+        res.writeHead(200, { 'Content-Type': 'text/html', 'Access-Control-Allow-Origin': '*' });
+        res.end(html);
+      } else json(res, 404, { error: 'netcontrol-app.html no encontrado' });
+    }
+    else if (p === '/status') json(res, 200, { ok: true, router: ROUTER, session: !!cookie });
+    else if (p === '/login') {
+      const r = await login(params.get('user') || 'root', params.get('pass') || 'adminHW');
+      json(res, 200, r);
+    }
+    else if (p === '/devices') {
+      if (!cookie) await login();
+      const r = await getDevices();
+      json(res, 200, r);
+    }
+    else if (p === '/block') {
+      if (!cookie) await login();
+      const r = await setMAC(params.get('mac'), (params.get('action') || 'block') === 'block');
+      json(res, 200, r);
+    }
+    else if (p === '/rawhtml') {
+      if (!cookie) await login();
+      const r = await rq({ path: url.parse(req.url, true).query.page || '/', method: 'GET' });
+      res.writeHead(200, { 'Content-Type': 'text/html', 'Access-Control-Allow-Origin': '*' });
       res.end(r.body);
-
-    // ── POST /block ───────────────────────────────────────────────────────
-    } else if (route === '/block' && req.method === 'POST') {
-      const mac    = params.get('mac');
-      const action = params.get('action') || 'block';
-      const result = await blockMAC(mac, action === 'block');
-      res.writeHead(200);
-      res.end(JSON.stringify(result));
-
-    // ── GET / — servir la app HTML ────────────────────────────────────────
-    } else if (route === '/' || route === '/index.html') {
-      const appPath = path.join(__dirname, 'netcontrol-app.html');
-      if (fs.existsSync(appPath)) {
-        res.setHeader('Content-Type', 'text/html');
-        res.writeHead(200);
-        res.end(fs.readFileSync(appPath));
-      } else {
-        res.writeHead(404);
-        res.end(JSON.stringify({ error: 'netcontrol-app.html no encontrado en la misma carpeta' }));
-      }
-
-    } else {
-      res.writeHead(404);
-      res.end(JSON.stringify({ error: 'Ruta no encontrada' }));
     }
-
-  } catch(e) {
-    console.error('Error:', e.message);
-    res.writeHead(500);
-    res.end(JSON.stringify({ ok: false, error: e.message }));
-  }
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-  // Obtener IP local
-  const { networkInterfaces } = require('os');
-  const nets = networkInterfaces();
-  let localIP = 'localhost';
-  for (const name of Object.keys(nets)) {
-    for (const net of nets[name]) {
-      if (net.family === 'IPv4' && !net.internal) {
-        localIP = net.address;
-      }
-    }
-  }
-
-  console.log('\n╔══════════════════════════════════════╗');
-  console.log('║       NetControl Proxy v1.0          ║');
-  console.log('╠══════════════════════════════════════╣');
-  console.log(`║  PC:     http://localhost:${PORT}       ║`);
-  console.log(`║  Celular: http://${localIP}:${PORT}  ║`);
-  console.log('║                                      ║');
-  console.log('║  Dejá esta ventana abierta           ║');
-  console.log('║  Ctrl+C para detener                 ║');
-  console.log('╚══════════════════════════════════════╝\n');
-  console.log(`Router objetivo: http://${ROUTER_IP}`);
-  console.log('Esperando conexiones...\n');
+    else json(res, 404, { error: 'not found' });
+  } catch(e) { console.error('[ERR]', e.message); json(res, 500, { error: e.message }); }
+}).listen(PORT, '127.0.0.1', () => {
+  console.log('\n========================================');
+  console.log('  NetControl Proxy activo');
+  console.log(`  Abri en Chrome: http://localhost:${PORT}`);
+  console.log('  Router: http://' + ROUTER);
+  console.log('  Deja Termux abierto en segundo plano');
+  console.log('========================================\n');
 });
